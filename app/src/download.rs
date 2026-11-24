@@ -78,6 +78,17 @@ fn video_id(token: &str) -> Option<&str> {
     .then_some(id)
 }
 
+pub trait Downloader {
+    /// Saves the audio of `url` in `folder` and returns the saved file.
+    fn download(
+        &self,
+        url: &str,
+        format: &str,
+        folder: &Path,
+        progress: &mut dyn FnMut(Update),
+    ) -> Result<PathBuf, String>;
+}
+
 pub struct Tools {
     path: OsString,
     downloader: Option<PathBuf>,
@@ -164,13 +175,15 @@ impl Tools {
         }
         missing
     }
+}
 
-    pub fn download(
+impl Downloader for Tools {
+    fn download(
         &self,
         url: &str,
         format: &str,
         folder: &Path,
-        mut progress: impl FnMut(Update),
+        progress: &mut dyn FnMut(Update),
     ) -> Result<PathBuf, String> {
         let downloader = self
             .downloader
@@ -233,10 +246,10 @@ impl Tools {
             let mut last_error = None;
             let mut last_warning = None;
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if let Some(error) = line.strip_prefix("ERROR: ") {
-                    last_error = Some(error.to_owned());
-                } else if let Some(warning) = line.strip_prefix("WARNING: ") {
-                    last_warning = Some(warning.to_owned());
+                match parse_diagnostic(&line) {
+                    Some(Diagnostic::Error(error)) => last_error = Some(error),
+                    Some(Diagnostic::Warning(warning)) => last_warning = Some(warning),
+                    None => {}
                 }
             }
             last_error.or(last_warning)
@@ -244,16 +257,10 @@ impl Tools {
         let stdout = child.stdout.take().expect("stdout is piped");
         let mut output = None;
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Some(title) = line.strip_prefix("bulk-title:") {
-                progress(Update::Title(title.to_owned()));
-            } else if let Some(path) = line.strip_prefix("bulk-file:") {
-                output = Some(PathBuf::from(path));
-            } else if let Some(percent) = line.strip_prefix("bulk-progress:") {
-                if let Ok(value) = percent.trim().trim_end_matches('%').parse::<f32>() {
-                    if value.is_finite() {
-                        progress(Update::Progress((value / 100.0).clamp(0.0, 1.0)));
-                    }
-                }
+            match parse_output(&line) {
+                Some(Output::Update(update)) => progress(update),
+                Some(Output::Saved(file)) => output = Some(file),
+                None => {}
             }
         }
         let status = child.wait().map_err(|err| err.to_string())?;
@@ -267,9 +274,47 @@ impl Tools {
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub enum Update {
     Title(String),
     Progress(f32),
+}
+
+#[derive(Debug, PartialEq)]
+enum Output {
+    Update(Update),
+    Saved(PathBuf),
+}
+
+/// Reads one line of yt-dlp standard output. The prefixes match the templates in `download`.
+fn parse_output(line: &str) -> Option<Output> {
+    if let Some(title) = line.strip_prefix("bulk-title:") {
+        Some(Output::Update(Update::Title(title.to_owned())))
+    } else if let Some(path) = line.strip_prefix("bulk-file:") {
+        Some(Output::Saved(PathBuf::from(path)))
+    } else {
+        let percent = line.strip_prefix("bulk-progress:")?;
+        let value: f32 = percent.trim().trim_end_matches('%').parse().ok()?;
+        value
+            .is_finite()
+            .then(|| Output::Update(Update::Progress((value / 100.0).clamp(0.0, 1.0))))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Diagnostic {
+    Error(String),
+    Warning(String),
+}
+
+/// Reads one line of yt-dlp standard error.
+fn parse_diagnostic(line: &str) -> Option<Diagnostic> {
+    if let Some(error) = line.strip_prefix("ERROR: ") {
+        Some(Diagnostic::Error(error.to_owned()))
+    } else {
+        line.strip_prefix("WARNING: ")
+            .map(|warning| Diagnostic::Warning(warning.to_owned()))
+    }
 }
 
 pub fn open_folder(folder: &Path) -> Result<(), String> {
@@ -287,4 +332,148 @@ pub fn open_folder(folder: &Path) -> Result<(), String> {
         let _ = child.wait();
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ID: &str = "dQw4w9WgXcQ";
+
+    #[test]
+    fn video_id_accepts_every_supported_link() {
+        for link in [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "http://youtube.com/watch?v=dQw4w9WgXcQ",
+            "youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://m.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://music.youtube.com/watch?v=dQw4w9WgXcQ&si=abc",
+            "https://WWW.YouTube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?list=PL123&v=dQw4w9WgXcQ&t=5s",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ#comments",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "https://youtu.be/dQw4w9WgXcQ?t=10",
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+            "https://www.youtube.com/live/dQw4w9WgXcQ?feature=share",
+            "https://www.youtube.com/embed/dQw4w9WgXcQ",
+            "https://www.youtube.com/v/dQw4w9WgXcQ",
+        ] {
+            assert_eq!(video_id(link), Some(ID), "{link}");
+        }
+    }
+
+    #[test]
+    fn video_id_rejects_other_links() {
+        for link in [
+            "",
+            "dQw4w9WgXcQ",
+            "https://www.youtube.com",
+            "https://www.youtube.com/",
+            "https://www.youtube.com/watch",
+            "https://www.youtube.com/watch?list=PL123",
+            "https://www.youtube.com/playlist?list=PL123",
+            "https://www.youtube.com/channel/dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=tooshort",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQQ",
+            "https://youtu.be/dQw4w9WgXc!",
+            "https://example.com/watch?v=dQw4w9WgXcQ",
+            "https://youtube.com.example.com/watch?v=dQw4w9WgXcQ",
+            "ftp://youtube.com/watch?v=dQw4w9WgXcQ",
+        ] {
+            assert_eq!(video_id(link), None, "{link}");
+        }
+    }
+
+    #[test]
+    fn parse_links_of_empty_text_finds_nothing() {
+        for text in ["", " \n\t , ", "<>"] {
+            let links = parse_links(text);
+            assert!(links.urls.is_empty());
+            assert_eq!((links.invalid, links.duplicates), (0, 0));
+        }
+    }
+
+    #[test]
+    fn parse_links_splits_and_normalizes_in_order() {
+        let links = parse_links(
+            "https://youtu.be/aaaaaaaaaaa, <https://youtu.be/bbbbbbbbbbb>\n\"youtube.com/shorts/ccccccccccc\"\t(https://youtu.be/d-d_ddddddd)",
+        );
+        assert_eq!(
+            links.urls,
+            [
+                "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+                "https://www.youtube.com/watch?v=bbbbbbbbbbb",
+                "https://www.youtube.com/watch?v=ccccccccccc",
+                "https://www.youtube.com/watch?v=d-d_ddddddd",
+            ]
+        );
+        assert_eq!((links.invalid, links.duplicates), (0, 0));
+    }
+
+    #[test]
+    fn parse_links_counts_invalid_and_duplicate_links() {
+        let links = parse_links(
+            "https://youtu.be/dQw4w9WgXcQ https://www.youtube.com/watch?v=dQw4w9WgXcQ hello https://example.com/",
+        );
+        assert_eq!(links.urls, ["https://www.youtube.com/watch?v=dQw4w9WgXcQ"]);
+        assert_eq!((links.invalid, links.duplicates), (2, 1));
+    }
+
+    #[test]
+    fn parse_output_reads_title_and_file() {
+        assert_eq!(
+            parse_output("bulk-title:A: title, 100%"),
+            Some(Output::Update(Update::Title("A: title, 100%".to_owned())))
+        );
+        assert_eq!(
+            parse_output("bulk-file:/tmp/My song [dQw4w9WgXcQ].mp3"),
+            Some(Output::Saved(PathBuf::from(
+                "/tmp/My song [dQw4w9WgXcQ].mp3"
+            )))
+        );
+    }
+
+    #[test]
+    fn parse_output_reads_and_clamps_progress() {
+        for (line, expected) in [
+            ("bulk-progress:  0.0%", 0.0),
+            ("bulk-progress: 50.0%", 0.5),
+            ("bulk-progress:100.0%", 1.0),
+            ("bulk-progress:150%", 1.0),
+            ("bulk-progress:-5%", 0.0),
+        ] {
+            assert_eq!(
+                parse_output(line),
+                Some(Output::Update(Update::Progress(expected))),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_output_ignores_other_lines() {
+        for line in [
+            "",
+            "[youtube] Extracting URL",
+            "bulk-progress:N/A",
+            "bulk-progress:NaN%",
+            "bulk-progress:inf%",
+            " bulk-title:indented",
+        ] {
+            assert_eq!(parse_output(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn parse_diagnostic_separates_errors_and_warnings() {
+        assert_eq!(
+            parse_diagnostic("ERROR: Video unavailable"),
+            Some(Diagnostic::Error("Video unavailable".to_owned()))
+        );
+        assert_eq!(
+            parse_diagnostic("WARNING: Slow connection"),
+            Some(Diagnostic::Warning("Slow connection".to_owned()))
+        );
+        assert_eq!(parse_diagnostic("[debug] ERROR: nested"), None);
+    }
 }
