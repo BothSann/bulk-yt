@@ -10,6 +10,7 @@ Batch Audio is a desktop app that saves audio from many YouTube links at once. I
 - Counts invalid links and skips duplicates.
 - Saves as MP3, WAV, M4A, FLAC, Opus, or AAC.
 - Shows the title, progress, and result of each download.
+- Cancels a running batch. Files that are already saved stay in the folder.
 - Lets you choose the output folder. The default is `Downloads/Batch Audio` in your home folder.
 - Light, dark, and system appearance.
 
@@ -39,14 +40,16 @@ cargo run --release
 ## Limitations
 
 - Downloads run one at a time.
-- A running batch cannot be cancelled, and the window stays open until it finishes.
+- The window stays open until a running batch finishes or is cancelled.
 - Playlists are not expanded.
 
 ## Project layout
 
 | Path | Purpose |
 | --- | --- |
-| `app/src/main.rs` | App state, interface, and background worker |
+| `app/src/main.rs` | App state and interface |
+| `app/src/queue.rs` | Download queue and background worker |
+| `app/src/cancel.rs` | Stopping a batch and its processes |
 | `app/src/download.rs` | Link parsing, tool detection, and yt-dlp |
 | `app/src/theme.rs` | Colors, fonts, and egui styling |
 | `app/assets/fonts` | Bundled fonts. Inter is under the SIL Open Font License. |

@@ -1,10 +1,14 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
+use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus};
 use std::thread;
+use std::time::Duration;
+
+use crate::cancel::Cancel;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum AudioFormat {
@@ -73,6 +77,7 @@ pub enum DownloadError {
     /// yt-dlp failed without printing an error or warning.
     Exit(ExitStatus),
     NoSavedFile,
+    Cancelled,
     /// The queue's worker thread ended before the job finished.
     WorkerStopped,
 }
@@ -88,6 +93,7 @@ impl fmt::Display for DownloadError {
             Self::NoSavedFile => {
                 f.write_str("The downloader finished without reporting a saved audio file.")
             }
+            Self::Cancelled => f.write_str("The download was cancelled."),
             Self::WorkerStopped => f.write_str("The download worker stopped unexpectedly."),
         }
     }
@@ -161,11 +167,13 @@ fn video_id(token: &str) -> Option<&str> {
 
 pub trait Downloader {
     /// Saves the audio of `url` in `folder` and returns the saved file.
+    /// Returns `DownloadError::Cancelled` soon after `cancel` is requested.
     fn download(
         &self,
         url: &str,
         format: AudioFormat,
         folder: &Path,
+        cancel: &Cancel,
         progress: &mut dyn FnMut(Update),
     ) -> Result<PathBuf, DownloadError>;
 }
@@ -261,12 +269,17 @@ impl Downloader for Tools {
         url: &str,
         format: AudioFormat,
         folder: &Path,
+        cancel: &Cancel,
         progress: &mut dyn FnMut(Update),
     ) -> Result<PathBuf, DownloadError> {
         let downloader = self
             .downloader
             .as_ref()
             .ok_or(DownloadError::MissingDownloader)?;
+        // yt-dlp converts straight into the final file name, and treats a file with that name as
+        // already downloaded. Unfinished files stay in this folder, so a cancelled conversion
+        // cannot pass for a saved one.
+        let partial = format!(".batch-audio-{}", video_id(url).unwrap_or("download"));
         let mut command = Command::new(downloader);
         command
             .env("PATH", &self.path)
@@ -300,55 +313,80 @@ impl Downloader for Tools {
                 "--paths",
             ])
             .arg(folder)
+            .arg("--paths")
+            .arg(format!("temp:{partial}"))
             .env("PYTHONIOENCODING", "utf-8");
         if let Some((name, path)) = &self.runtime {
             let mut runtime = OsString::from(format!("{name}:"));
             runtime.push(path);
             command.arg("--js-runtimes").arg(runtime);
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
+        command.arg("--").arg(url);
+        let result = run(&mut command, cancel, progress);
+        let partial = folder.join(partial);
+        if matches!(result, Ok(_) | Err(DownloadError::Cancelled)) {
+            remove_partial(&partial);
+        } else {
+            // Removes the folder only if it is empty, so a failed download can resume.
+            let _ = fs::remove_dir(&partial);
         }
-        let mut child = command
-            .arg("--")
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(DownloadError::Start)?;
-        let stderr = child.stderr.take().expect("stderr is piped");
-        let errors = thread::spawn(move || {
-            let mut last_error = None;
-            let mut last_warning = None;
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                match parse_diagnostic(&line) {
-                    Some(Diagnostic::Error(error)) => last_error = Some(error),
-                    Some(Diagnostic::Warning(warning)) => last_warning = Some(warning),
-                    None => {}
-                }
+        result
+    }
+}
+
+/// Deletes the temporary files of a saved or cancelled download.
+fn remove_partial(folder: &Path) {
+    // Windows can keep a file locked for a moment after its process stops.
+    for _ in 0..20 {
+        match fs::remove_dir_all(folder) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                thread::sleep(Duration::from_millis(50));
             }
-            last_error.or(last_warning)
-        });
-        let stdout = child.stdout.take().expect("stdout is piped");
-        let mut output = None;
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            match parse_output(&line) {
-                Some(Output::Update(update)) => progress(update),
-                Some(Output::Saved(file)) => output = Some(file),
+            _ => return,
+        }
+    }
+}
+
+/// Runs yt-dlp and returns the file it saved.
+fn run(
+    command: &mut Command,
+    cancel: &Cancel,
+    progress: &mut dyn FnMut(Update),
+) -> Result<PathBuf, DownloadError> {
+    if cancel.is_requested() {
+        return Err(DownloadError::Cancelled);
+    }
+    let (stdout, stderr) = cancel.spawn(command).map_err(DownloadError::Start)?;
+    let errors = thread::spawn(move || {
+        let mut last_error = None;
+        let mut last_warning = None;
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            match parse_diagnostic(&line) {
+                Some(Diagnostic::Error(error)) => last_error = Some(error),
+                Some(Diagnostic::Warning(warning)) => last_warning = Some(warning),
                 None => {}
             }
         }
-        let status = child.wait().map_err(DownloadError::Wait)?;
-        let diagnostic = errors.join().ok().flatten();
-        if !status.success() {
-            return Err(diagnostic.map_or(DownloadError::Exit(status), DownloadError::Reported));
+        last_error.or(last_warning)
+    });
+    let mut output = None;
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        match parse_output(&line) {
+            Some(Output::Update(update)) => progress(update),
+            Some(Output::Saved(file)) => output = Some(file),
+            None => {}
         }
-        output
-            .filter(|file| file.is_file())
-            .ok_or(DownloadError::NoSavedFile)
+    }
+    let status = cancel.wait().map_err(DownloadError::Wait)?;
+    let diagnostic = errors.join().ok().flatten();
+    let saved = output.filter(|file| file.is_file());
+    if status.success() {
+        saved.ok_or(DownloadError::NoSavedFile)
+    } else if cancel.is_requested() {
+        // yt-dlp reports a file only after moving it, so a reported file is complete.
+        saved.ok_or(DownloadError::Cancelled)
+    } else {
+        Err(diagnostic.map_or(DownloadError::Exit(status), DownloadError::Reported))
     }
 }
 
@@ -414,6 +452,10 @@ pub fn open_folder(folder: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Instant;
+
     use super::*;
 
     const ID: &str = "dQw4w9WgXcQ";
@@ -465,6 +507,10 @@ mod tests {
             (
                 DownloadError::NoSavedFile,
                 "The downloader finished without reporting a saved audio file.".to_owned(),
+            ),
+            (
+                DownloadError::Cancelled,
+                "The download was cancelled.".to_owned(),
             ),
             (
                 DownloadError::WorkerStopped,
@@ -610,5 +656,133 @@ mod tests {
             Some(Diagnostic::Warning("Slow connection".to_owned()))
         );
         assert_eq!(parse_diagnostic("[debug] ERROR: nested"), None);
+    }
+
+    const FAKE: &str = "BULK_YT_FAKE_DOWNLOADER";
+
+    /// Not a test. `fake_downloader` runs this binary again to act as yt-dlp and its child.
+    #[test]
+    #[ignore = "runs only as a child process of other tests"]
+    fn act_as_fake_downloader() {
+        let Ok(setting) = std::env::var(FAKE) else {
+            return;
+        };
+        let (role, address) = setting.split_once(' ').unwrap();
+        let _connection = TcpStream::connect(address).unwrap();
+        if role == "parent" {
+            let mut child = fake_downloader("child", address).spawn().unwrap();
+            println!("\nbulk-progress:50%");
+            child.wait().unwrap();
+            return;
+        }
+        thread::sleep(Duration::from_secs(60));
+    }
+
+    fn fake_downloader(role: &str, address: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "download::tests::act_as_fake_downloader"])
+            .args(["--ignored", "--nocapture"])
+            .env(FAKE, format!("{role} {address}"));
+        command
+    }
+
+    /// Waits for a process to connect. The connection closes when that process ends.
+    fn accept(listener: &TcpListener) -> TcpStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            match listener.accept() {
+                Ok((connection, _)) => {
+                    connection.set_nonblocking(false).unwrap();
+                    return connection;
+                }
+                Err(error) => {
+                    assert!(Instant::now() < deadline, "no process connected: {error}");
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    fn assert_ended(mut connection: TcpStream) {
+        connection
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        match connection.read(&mut [0]) {
+            Ok(0) => {}
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+            other => panic!("the process is still running: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_stops_the_downloader_and_its_child() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let cancel = Cancel::default();
+        let worker = thread::spawn({
+            let cancel = cancel.clone();
+            move || {
+                let mut updates = Vec::new();
+                let result = run(
+                    &mut fake_downloader("parent", &address),
+                    &cancel,
+                    &mut |update| updates.push(update),
+                );
+                (result, updates)
+            }
+        });
+        let connections = [accept(&listener), accept(&listener)];
+        // Both processes are running and write nothing more, so only the kill can end `run`.
+        thread::sleep(Duration::from_millis(200));
+        cancel.request();
+
+        for connection in connections {
+            assert_ended(connection);
+        }
+        let (result, updates) = worker.join().unwrap();
+        assert!(
+            matches!(result, Err(DownloadError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(updates, [Update::Progress(0.5)]);
+    }
+
+    #[test]
+    fn cancel_before_the_start_runs_nothing() {
+        let cancel = Cancel::default();
+        cancel.request();
+        let mut command = Command::new("this-program-does-not-exist");
+        let result = run(&mut command, &cancel, &mut |_| {});
+        assert!(
+            matches!(result, Err(DownloadError::Cancelled)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn cancel_between_the_check_and_the_start_still_stops_the_process() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let cancel = Cancel::default();
+        cancel.request();
+        // `spawn` is what `run` calls after its own check.
+        let _output = cancel
+            .spawn(&mut fake_downloader("child", &address))
+            .unwrap();
+        let status = cancel.wait().unwrap();
+        assert!(!status.success());
+    }
+
+    #[test]
+    fn remove_partial_deletes_files_and_accepts_a_missing_folder() {
+        let folder =
+            std::env::temp_dir().join(format!("bulk-yt-partial-test-{}", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("audio.wav"), "partial").unwrap();
+        remove_partial(&folder);
+        assert!(!folder.exists());
+        remove_partial(&folder);
     }
 }

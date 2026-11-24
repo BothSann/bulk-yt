@@ -1,7 +1,8 @@
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
+use crate::cancel::Cancel;
 use crate::download::{AudioFormat, DownloadError, Downloader, Update};
 
 pub enum State {
@@ -11,6 +12,7 @@ pub enum State {
     Converting,
     Saved(PathBuf),
     Failed(DownloadError),
+    Cancelled,
 }
 
 pub struct Job {
@@ -29,6 +31,30 @@ enum Event {
 pub struct Queue {
     jobs: Vec<Job>,
     receiver: Option<Receiver<Event>>,
+    cancel: Cancel,
+}
+
+/// The worker's side of the channel. Dropping it closes the channel and then wakes the UI, also
+/// when the worker panics.
+struct Reporter<N: Fn()> {
+    sender: Option<Sender<Event>>,
+    notify: N,
+}
+
+impl<N: Fn()> Reporter<N> {
+    fn send(&self, event: Event) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(event);
+        }
+        (self.notify)();
+    }
+}
+
+impl<N: Fn()> Drop for Reporter<N> {
+    fn drop(&mut self) {
+        self.sender = None;
+        (self.notify)();
+    }
 }
 
 impl Queue {
@@ -38,6 +64,17 @@ impl Queue {
 
     pub fn is_running(&self) -> bool {
         self.receiver.is_some()
+    }
+
+    pub fn is_cancelling(&self) -> bool {
+        self.is_running() && self.cancel.is_requested()
+    }
+
+    /// Stops the running download and skips the waiting ones. Does not block.
+    pub fn cancel(&self) {
+        if self.is_running() {
+            self.cancel.request();
+        }
     }
 
     /// Replaces the current jobs and downloads `urls` in order on a worker thread.
@@ -60,20 +97,24 @@ impl Queue {
             .collect();
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
+        self.cancel = Cancel::default();
+        let cancel = self.cancel.clone();
         thread::spawn(move || {
-            let send = |event| {
-                let _ = sender.send(event);
-                notify();
+            let reporter = Reporter {
+                sender: Some(sender),
+                notify,
             };
             for (index, url) in urls.iter().enumerate() {
-                send(Event::Started(index));
-                let result = downloader.download(url, format, &folder, &mut |update| {
-                    send(Event::Updated(index, update))
+                if cancel.is_requested() {
+                    reporter.send(Event::Finished(index, Err(DownloadError::Cancelled)));
+                    continue;
+                }
+                reporter.send(Event::Started(index));
+                let result = downloader.download(url, format, &folder, &cancel, &mut |update| {
+                    reporter.send(Event::Updated(index, update))
                 });
-                send(Event::Finished(index, result));
+                reporter.send(Event::Finished(index, result));
             }
-            drop(sender);
-            notify();
         });
     }
 
@@ -98,6 +139,7 @@ impl Queue {
                 Ok(Event::Finished(index, result)) => {
                     self.jobs[index].state = match result {
                         Ok(file) => State::Saved(file),
+                        Err(DownloadError::Cancelled) => State::Cancelled,
                         Err(error) => State::Failed(error),
                     };
                 }
@@ -139,6 +181,7 @@ mod tests {
             url: &str,
             _format: AudioFormat,
             _folder: &Path,
+            _cancel: &Cancel,
             progress: &mut dyn FnMut(Update),
         ) -> Result<PathBuf, DownloadError> {
             (self.0)(url, progress)
@@ -302,6 +345,7 @@ mod tests {
                 _url: &str,
                 format: AudioFormat,
                 folder: &Path,
+                _cancel: &Cancel,
                 progress: &mut dyn FnMut(Update),
             ) -> Result<PathBuf, DownloadError> {
                 *self.0.lock().unwrap() = Some((format, folder.to_owned()));
@@ -351,5 +395,117 @@ mod tests {
 
         assert_eq!(queue.jobs().len(), 1);
         assert_eq!(queue.jobs()[0].url, "c");
+    }
+
+    /// Saves "good", fails "bad", and runs anything else until it is cancelled.
+    struct UntilCancelled(Arc<Mutex<Vec<String>>>);
+
+    impl Downloader for UntilCancelled {
+        fn download(
+            &self,
+            url: &str,
+            _format: AudioFormat,
+            _folder: &Path,
+            cancel: &Cancel,
+            progress: &mut dyn FnMut(Update),
+        ) -> Result<PathBuf, DownloadError> {
+            self.0.lock().unwrap().push(url.to_owned());
+            match url {
+                "good" => Ok(PathBuf::from("good.mp3")),
+                "bad" => Err(DownloadError::NoSavedFile),
+                _ => {
+                    progress(Update::Progress(0.5));
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !cancel.is_requested() && Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(DownloadError::Cancelled)
+                }
+            }
+        }
+    }
+
+    fn start_until_cancelled(queue: &mut Queue, urls: &[&str]) -> Arc<Mutex<Vec<String>>> {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        queue.start(
+            UntilCancelled(started.clone()),
+            urls.iter().map(|url| (*url).to_owned()).collect(),
+            AudioFormat::Mp3,
+            PathBuf::from("out"),
+            || {},
+        );
+        started
+    }
+
+    #[test]
+    fn cancel_keeps_finished_jobs_and_cancels_the_rest() {
+        let mut queue = Queue::default();
+        let started = start_until_cancelled(&mut queue, &["good", "bad", "slow", "next", "last"]);
+        poll_until(
+            &mut queue,
+            |queue| matches!(queue.jobs()[2].state, State::Downloading(value) if value == 0.5),
+        );
+        assert!(!queue.is_cancelling());
+        queue.cancel();
+        assert!(queue.is_cancelling());
+        finish(&mut queue);
+
+        assert!(!queue.is_cancelling());
+        let jobs = queue.jobs();
+        assert!(matches!(jobs[0].state, State::Saved(_)));
+        assert!(matches!(
+            jobs[1].state,
+            State::Failed(DownloadError::NoSavedFile)
+        ));
+        for job in &jobs[2..] {
+            assert!(matches!(job.state, State::Cancelled), "{}", job.url);
+        }
+        assert_eq!(*started.lock().unwrap(), ["good", "bad", "slow"]);
+    }
+
+    #[test]
+    fn new_batch_runs_after_a_cancelled_one() {
+        let mut queue = Queue::default();
+        start_until_cancelled(&mut queue, &["slow"]);
+        queue.cancel();
+        finish(&mut queue);
+        // A request with nothing running must not affect the next batch.
+        queue.cancel();
+
+        start_until_cancelled(&mut queue, &["good"]);
+        finish(&mut queue);
+        assert!(matches!(queue.jobs()[0].state, State::Saved(_)));
+    }
+
+    #[test]
+    fn worker_panic_closes_the_channel_and_then_notifies() {
+        let notified = Arc::new(AtomicUsize::new(0));
+        let counter = notified.clone();
+        let mut queue = Queue::default();
+        queue.start(
+            Fake(
+                |_: &str, _: &mut dyn FnMut(Update)| -> Result<PathBuf, DownloadError> {
+                    panic!("expected by this test")
+                },
+            ),
+            vec!["a".to_owned()],
+            AudioFormat::Mp3,
+            PathBuf::from("out"),
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        // One call for the started job, and one for the closed channel.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while notified.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < deadline, "the panic did not notify");
+            thread::sleep(Duration::from_millis(1));
+        }
+        queue.poll();
+        assert!(!queue.is_running());
+        assert!(matches!(
+            queue.jobs()[0].state,
+            State::Failed(DownloadError::WorkerStopped)
+        ));
     }
 }
