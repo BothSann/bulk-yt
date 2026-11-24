@@ -1,0 +1,19 @@
+# Rust build output
+/app/target/
+/app/shots/
+
+# Craft Anything builder files
+/attachments/
+/build-activity.log
+/capture/
+/checks/
+/craft.json
+/feed.json
+/inbox/
+/investigation.cany/
+/pinned/
+/reference/
+/usage.json
+
+# macOS
+.DS_Store
