@@ -78,7 +78,7 @@ pub enum DownloadError {
     Exit(ExitStatus),
     NoSavedFile,
     Cancelled,
-    /// The queue's worker thread ended before the job finished.
+    /// The download crashed, or its worker thread ended before the job finished.
     WorkerStopped,
 }
 
@@ -356,7 +356,7 @@ fn run(
     if cancel.is_requested() {
         return Err(DownloadError::Cancelled);
     }
-    let (stdout, stderr) = cancel.spawn(command).map_err(DownloadError::Start)?;
+    let (running, stdout, stderr) = cancel.spawn(command).map_err(DownloadError::Start)?;
     let errors = thread::spawn(move || {
         let mut last_error = None;
         let mut last_warning = None;
@@ -377,7 +377,7 @@ fn run(
             None => {}
         }
     }
-    let status = cancel.wait().map_err(DownloadError::Wait)?;
+    let status = running.wait().map_err(DownloadError::Wait)?;
     let diagnostic = errors.join().ok().flatten();
     let saved = output.filter(|file| file.is_file());
     if status.success() {
@@ -454,6 +454,7 @@ pub fn open_folder(folder: &Path) -> Result<(), String> {
 mod tests {
     use std::io::Read;
     use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
     use std::time::Instant;
 
     use super::*;
@@ -767,12 +768,93 @@ mod tests {
         let address = listener.local_addr().unwrap().to_string();
         let cancel = Cancel::default();
         cancel.request();
+        // Time for the request to finish, so that it cannot find the process.
+        thread::sleep(Duration::from_millis(200));
         // `spawn` is what `run` calls after its own check.
-        let _output = cancel
+        let (running, _stdout, _stderr) = cancel
             .spawn(&mut fake_downloader("child", &address))
             .unwrap();
-        let status = cancel.wait().unwrap();
-        assert!(!status.success());
+        assert!(!running.wait().unwrap().success());
+    }
+
+    #[test]
+    fn cancel_stops_every_running_downloader() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let cancel = Cancel::default();
+        let workers: Vec<_> = (0..3)
+            .map(|_| {
+                let (cancel, address) = (cancel.clone(), address.clone());
+                thread::spawn(move || {
+                    run(
+                        &mut fake_downloader("parent", &address),
+                        &cancel,
+                        &mut |_| {},
+                    )
+                })
+            })
+            .collect();
+        // Each downloader has a child.
+        let connections: Vec<_> = (0..6).map(|_| accept(&listener)).collect();
+        cancel.request();
+
+        for connection in connections {
+            assert_ended(connection);
+        }
+        for worker in workers {
+            let result = worker.join().unwrap();
+            assert!(
+                matches!(result, Err(DownloadError::Cancelled)),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn crash_stops_its_own_downloader_and_no_other() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let cancel = Cancel::default();
+        let (other, _stdout, _stderr) = cancel
+            .spawn(&mut fake_downloader("child", &address))
+            .unwrap();
+        let mut other_connection = accept(&listener);
+
+        let (crash, blocked) = mpsc::channel::<()>();
+        let worker = thread::spawn({
+            let cancel = cancel.clone();
+            move || {
+                run(
+                    &mut fake_downloader("parent", &address),
+                    &cancel,
+                    &mut |_| {
+                        let _ = blocked.recv();
+                        panic!("expected by this test");
+                    },
+                )
+            }
+        });
+        let connections = [accept(&listener), accept(&listener)];
+        // Both processes are running, so only the crash can end them.
+        crash.send(()).unwrap();
+        assert!(worker.join().is_err());
+        for connection in connections {
+            assert_ended(connection);
+        }
+        other_connection
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let error = other_connection.read(&mut [0]).unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "{error}"
+        );
+
+        cancel.request();
+        assert!(!other.wait().unwrap().success());
     }
 
     #[test]

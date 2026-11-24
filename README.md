@@ -39,7 +39,7 @@ cargo run --release
 
 ## Limitations
 
-- Downloads run one at a time.
+- At most three downloads run at once.
 - The window stays open until a running batch finishes or is cancelled.
 - Playlists are not expanded.
 
@@ -48,7 +48,7 @@ cargo run --release
 | Path | Purpose |
 | --- | --- |
 | `app/src/main.rs` | App state and interface |
-| `app/src/queue.rs` | Download queue and background worker |
+| `app/src/queue.rs` | Download queue and background workers |
 | `app/src/cancel.rs` | Stopping a batch and its processes |
 | `app/src/download.rs` | Link parsing, tool detection, and yt-dlp |
 | `app/src/theme.rs` | Colors, fonts, and egui styling |
