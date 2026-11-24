@@ -2,7 +2,6 @@ mod download;
 mod queue;
 mod theme;
 
-use std::ffi::OsString;
 use std::fs;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -22,13 +21,11 @@ fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
     let screenshot = match (args.next(), args.next(), args.next()) {
         (None, None, None) => None,
-        (Some(flag), Some(path), None) if flag == OsString::from("--screenshot") => {
-            Some(Screenshot {
-                path: path.into(),
-                frames: 0,
-                requested: None,
-            })
-        }
+        (Some(flag), Some(path), None) if flag == "--screenshot" => Some(Screenshot {
+            path: path.into(),
+            frames: 0,
+            requested: None,
+        }),
         _ => {
             eprintln!("Usage: bulk-yt [--screenshot <file.png>]");
             return ExitCode::FAILURE;
