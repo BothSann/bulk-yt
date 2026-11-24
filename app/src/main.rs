@@ -41,6 +41,7 @@ fn main() -> ExitCode {
             viewport = viewport.with_window_level(egui::WindowLevel::AlwaysOnBottom);
         }
     }
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut options = eframe::NativeOptions {
         viewport,
         ..Default::default()
