@@ -1,9 +1,15 @@
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 
 use crate::cancel::Cancel;
 use crate::download::{AudioFormat, DownloadError, Downloader, Update};
+
+/// The number of downloads that can run at once.
+const MAX_WORKERS: usize = 3;
 
 pub enum State {
     Waiting,
@@ -34,11 +40,11 @@ pub struct Queue {
     cancel: Cancel,
 }
 
-/// The worker's side of the channel. Dropping it closes the channel and then wakes the UI, also
-/// when the worker panics.
+/// One worker's side of the channel. Dropping it closes that side and then wakes the UI, also when
+/// the worker panics. The last one to drop closes the channel before it wakes the UI.
 struct Reporter<N: Fn()> {
     sender: Option<Sender<Event>>,
-    notify: N,
+    notify: Arc<N>,
 }
 
 impl<N: Fn()> Reporter<N> {
@@ -57,6 +63,47 @@ impl<N: Fn()> Drop for Reporter<N> {
     }
 }
 
+/// The work that the workers of one batch share.
+struct Batch<D> {
+    downloader: D,
+    urls: Vec<String>,
+    format: AudioFormat,
+    folder: PathBuf,
+    cancel: Cancel,
+    /// The next job to start.
+    next: AtomicUsize,
+}
+
+impl<D: Downloader> Batch<D> {
+    /// Takes jobs in order until none are left.
+    fn work(&self, reporter: &Reporter<impl Fn()>) {
+        loop {
+            let index = self.next.fetch_add(1, Ordering::SeqCst);
+            let Some(url) = self.urls.get(index) else {
+                return;
+            };
+            if self.cancel.is_requested() {
+                reporter.send(Event::Finished(index, Err(DownloadError::Cancelled)));
+                continue;
+            }
+            reporter.send(Event::Started(index));
+            let download = || {
+                self.downloader.download(
+                    url,
+                    self.format,
+                    &self.folder,
+                    &self.cancel,
+                    &mut |update| reporter.send(Event::Updated(index, update)),
+                )
+            };
+            // A crash fails its own job, and this worker takes the next one.
+            let result = panic::catch_unwind(AssertUnwindSafe(download))
+                .unwrap_or(Err(DownloadError::WorkerStopped));
+            reporter.send(Event::Finished(index, result));
+        }
+    }
+}
+
 impl Queue {
     pub fn jobs(&self) -> &[Job] {
         &self.jobs
@@ -70,22 +117,22 @@ impl Queue {
         self.is_running() && self.cancel.is_requested()
     }
 
-    /// Stops the running download and skips the waiting ones. Does not block.
+    /// Stops the running downloads and skips the waiting ones. Does not block.
     pub fn cancel(&self) {
         if self.is_running() {
             self.cancel.request();
         }
     }
 
-    /// Replaces the current jobs and downloads `urls` in order on a worker thread.
-    /// The worker calls `notify` whenever `poll` has something new to read.
+    /// Replaces the current jobs and downloads `urls` on up to `MAX_WORKERS` threads. Jobs start in
+    /// order. The workers call `notify` whenever `poll` has something new to read.
     pub fn start(
         &mut self,
-        downloader: impl Downloader + Send + 'static,
+        downloader: impl Downloader + Send + Sync + 'static,
         urls: Vec<String>,
         format: AudioFormat,
         folder: PathBuf,
-        notify: impl Fn() + Send + 'static,
+        notify: impl Fn() + Send + Sync + 'static,
     ) {
         self.jobs = urls
             .iter()
@@ -98,24 +145,24 @@ impl Queue {
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         self.cancel = Cancel::default();
-        let cancel = self.cancel.clone();
-        thread::spawn(move || {
-            let reporter = Reporter {
-                sender: Some(sender),
-                notify,
-            };
-            for (index, url) in urls.iter().enumerate() {
-                if cancel.is_requested() {
-                    reporter.send(Event::Finished(index, Err(DownloadError::Cancelled)));
-                    continue;
-                }
-                reporter.send(Event::Started(index));
-                let result = downloader.download(url, format, &folder, &cancel, &mut |update| {
-                    reporter.send(Event::Updated(index, update))
-                });
-                reporter.send(Event::Finished(index, result));
-            }
+        let workers = urls.len().clamp(1, MAX_WORKERS);
+        let batch = Arc::new(Batch {
+            downloader,
+            urls,
+            format,
+            folder,
+            cancel: self.cancel.clone(),
+            next: AtomicUsize::new(0),
         });
+        let notify = Arc::new(notify);
+        for _ in 0..workers {
+            let batch = batch.clone();
+            let reporter = Reporter {
+                sender: Some(sender.clone()),
+                notify: notify.clone(),
+            };
+            thread::spawn(move || batch.work(&reporter));
+        }
     }
 
     /// Applies every pending worker event without blocking.
@@ -164,8 +211,7 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -190,7 +236,10 @@ mod tests {
 
     fn start<F>(urls: &[&str], download: F) -> Queue
     where
-        F: Fn(&str, &mut dyn FnMut(Update)) -> Result<PathBuf, DownloadError> + Send + 'static,
+        F: Fn(&str, &mut dyn FnMut(Update)) -> Result<PathBuf, DownloadError>
+            + Send
+            + Sync
+            + 'static,
     {
         let mut queue = Queue::default();
         let urls = urls.iter().map(|url| (*url).to_owned()).collect();
@@ -226,11 +275,8 @@ mod tests {
     }
 
     #[test]
-    fn saves_every_job_in_order() {
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let seen = order.clone();
-        let mut queue = start(&["a", "b", "c"], move |url, progress| {
-            seen.lock().unwrap().push(url.to_owned());
+    fn saves_every_job_and_keeps_their_order() {
+        let mut queue = start(&["a", "b", "c"], |url, progress| {
             progress(Update::Title(format!("Title {url}")));
             progress(Update::Progress(1.0));
             Ok(PathBuf::from(format!("{url}.mp3")))
@@ -238,7 +284,6 @@ mod tests {
         assert!(queue.is_running());
         finish(&mut queue);
 
-        assert_eq!(*order.lock().unwrap(), ["a", "b", "c"]);
         for (job, url) in queue.jobs().iter().zip(["a", "b", "c"]) {
             assert_eq!(job.url, url);
             assert_eq!(job.title, Some(format!("Title {url}")));
@@ -263,30 +308,112 @@ mod tests {
     }
 
     #[test]
-    fn worker_crash_fails_unfinished_jobs_and_keeps_saved_ones() {
-        let mut queue = start(&["good", "crash", "never"], |url, _| match url {
+    fn crashes_fail_their_own_jobs_and_the_rest_still_run() {
+        // More crashes than workers, so a worker that ends after a crash leaves jobs behind.
+        let urls = ["crash", "crash", "crash", "crash", "good", "good"];
+        let mut queue = start(&urls, |url, _| match url {
             "good" => Ok(PathBuf::from("good.mp3")),
             _ => panic!("expected by this test"),
         });
         finish(&mut queue);
 
-        assert!(matches!(queue.jobs()[0].state, State::Saved(_)));
-        for job in &queue.jobs()[1..] {
+        for job in &queue.jobs()[..4] {
             assert!(matches!(
                 job.state,
                 State::Failed(DownloadError::WorkerStopped)
             ));
+        }
+        for job in &queue.jobs()[4..] {
+            assert!(matches!(job.state, State::Saved(_)));
+        }
+    }
+
+    #[test]
+    fn crash_fails_its_job_while_the_others_run() {
+        let (release, blocked) = mpsc::channel::<()>();
+        let blocked = Mutex::new(blocked);
+        let mut queue = start(&["slow", "crash"], move |url, _| {
+            if url == "crash" {
+                panic!("expected by this test");
+            }
+            let _ = blocked.lock().unwrap().recv();
+            Ok(PathBuf::from("slow.mp3"))
+        });
+        poll_until(&mut queue, |queue| {
+            matches!(
+                queue.jobs()[1].state,
+                State::Failed(DownloadError::WorkerStopped)
+            )
+        });
+        assert!(queue.is_running());
+        drop(release);
+        finish(&mut queue);
+        assert!(matches!(queue.jobs()[0].state, State::Saved(_)));
+    }
+
+    #[test]
+    fn runs_three_downloads_at_once_and_starts_the_rest_in_order() {
+        #[derive(Default)]
+        struct Log {
+            started: Vec<String>,
+            running: usize,
+            most: usize,
+        }
+        let log = Arc::new(Mutex::new(Log::default()));
+        let (release, blocked) = mpsc::channel::<()>();
+        let blocked = Mutex::new(blocked);
+        let urls = ["a", "b", "c", "d", "e", "f", "g"];
+        let mut queue = start(&urls, {
+            let log = log.clone();
+            move |url, _| {
+                {
+                    let mut log = log.lock().unwrap();
+                    log.started.push(url.to_owned());
+                    log.running += 1;
+                    log.most = log.most.max(log.running);
+                }
+                let _ = blocked.lock().unwrap().recv();
+                log.lock().unwrap().running -= 1;
+                Ok(PathBuf::from("saved.mp3"))
+            }
+        });
+        // Each release lets one download end, so exactly one more can start.
+        for started in 3..=urls.len() {
+            poll_until(&mut queue, |_| log.lock().unwrap().started.len() >= started);
+            // Time for a download over the limit to start.
+            thread::sleep(Duration::from_millis(50));
+            queue.poll();
+            let log = log.lock().unwrap();
+            assert_eq!(log.started.len(), started);
+            assert_eq!(log.running, 3);
+            for job in &queue.jobs()[started..] {
+                assert!(matches!(job.state, State::Waiting), "{}", job.url);
+            }
+            drop(log);
+            release.send(()).unwrap();
+        }
+        drop(release);
+        finish(&mut queue);
+
+        let mut log = log.lock().unwrap();
+        assert_eq!(log.most, 3);
+        // The first three start together, so they can reach the downloader in any order.
+        log.started[..3].sort();
+        assert_eq!(log.started, urls);
+        for job in queue.jobs() {
+            assert!(matches!(job.state, State::Saved(_)), "{}", job.url);
         }
     }
 
     #[test]
     fn job_moves_from_downloading_to_converting_to_saved() {
         let (step, blocked) = mpsc::channel::<()>();
+        let blocked = Mutex::new(blocked);
         let mut queue = start(&["a"], move |_, progress| {
             progress(Update::Progress(0.999));
-            let _ = blocked.recv();
+            let _ = blocked.lock().unwrap().recv();
             progress(Update::Progress(1.0));
-            let _ = blocked.recv();
+            let _ = blocked.lock().unwrap().recv();
             Ok(PathBuf::from("saved.mp3"))
         });
         poll_until(
@@ -319,21 +446,23 @@ mod tests {
     #[test]
     fn reports_progress_while_the_next_job_waits() {
         let (release, blocked) = mpsc::channel::<()>();
-        let mut queue = start(&["first", "second"], move |_, progress| {
+        let blocked = Mutex::new(blocked);
+        let mut queue = start(&["a", "b", "c", "next"], move |_, progress| {
             progress(Update::Progress(0.5));
-            let _ = blocked.recv();
+            let _ = blocked.lock().unwrap().recv();
             Ok(PathBuf::from("saved.mp3"))
         });
-        poll_until(
-            &mut queue,
-            |queue| matches!(queue.jobs()[0].state, State::Downloading(value) if value == 0.5),
-        );
+        poll_until(&mut queue, |queue| {
+            queue.jobs()[..3]
+                .iter()
+                .all(|job| matches!(job.state, State::Downloading(value) if value == 0.5))
+        });
         assert!(queue.is_running());
-        assert!(matches!(queue.jobs()[1].state, State::Waiting));
+        assert!(matches!(queue.jobs()[3].state, State::Waiting));
 
         drop(release);
         finish(&mut queue);
-        assert!(matches!(queue.jobs()[1].state, State::Saved(_)));
+        assert!(matches!(queue.jobs()[3].state, State::Saved(_)));
     }
 
     #[test]
@@ -440,11 +569,13 @@ mod tests {
     #[test]
     fn cancel_keeps_finished_jobs_and_cancels_the_rest() {
         let mut queue = Queue::default();
-        let started = start_until_cancelled(&mut queue, &["good", "bad", "slow", "next", "last"]);
-        poll_until(
-            &mut queue,
-            |queue| matches!(queue.jobs()[2].state, State::Downloading(value) if value == 0.5),
-        );
+        let urls = ["good", "bad", "slow 1", "slow 2", "slow 3", "next", "last"];
+        let started = start_until_cancelled(&mut queue, &urls);
+        poll_until(&mut queue, |queue| {
+            queue.jobs()[2..5]
+                .iter()
+                .all(|job| matches!(job.state, State::Downloading(value) if value == 0.5))
+        });
         assert!(!queue.is_cancelling());
         queue.cancel();
         assert!(queue.is_cancelling());
@@ -460,7 +591,9 @@ mod tests {
         for job in &jobs[2..] {
             assert!(matches!(job.state, State::Cancelled), "{}", job.url);
         }
-        assert_eq!(*started.lock().unwrap(), ["good", "bad", "slow"]);
+        let mut started = started.lock().unwrap();
+        started.sort();
+        assert_eq!(*started, ["bad", "good", "slow 1", "slow 2", "slow 3"]);
     }
 
     #[test]
@@ -478,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_panic_closes_the_channel_and_then_notifies() {
+    fn crash_fails_the_job_closes_the_channel_and_then_notifies() {
         let notified = Arc::new(AtomicUsize::new(0));
         let counter = notified.clone();
         let mut queue = Queue::default();
@@ -495,9 +628,9 @@ mod tests {
                 counter.fetch_add(1, Ordering::SeqCst);
             },
         );
-        // One call for the started job, and one for the closed channel.
+        // One call for the started job, one for its failure, and one for the closed channel.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while notified.load(Ordering::SeqCst) < 2 {
+        while notified.load(Ordering::SeqCst) < 3 {
             assert!(Instant::now() < deadline, "the panic did not notify");
             thread::sleep(Duration::from_millis(1));
         }

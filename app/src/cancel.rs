@@ -1,19 +1,29 @@
+use std::collections::HashMap;
 use std::io;
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
-/// Stops a batch and the process tree it is running. Clones share the same state.
+/// Stops a batch and the process trees it is running. Clones share the same state.
 #[derive(Clone, Default)]
 pub struct Cancel(Arc<Shared>);
 
 #[derive(Default)]
 struct Shared {
     requested: AtomicBool,
-    /// The running process. It is reaped only while this is locked, so its ID stays valid here.
-    child: Mutex<Option<Child>>,
+    /// The running processes. Each one is reaped only while this is locked or after it leaves
+    /// the map, so the ID of every process in the map stays valid.
+    children: Mutex<HashMap<u64, Child>>,
+    /// The next key in `children`. Process IDs are not keys, because the system reuses them.
+    next_key: AtomicU64,
+}
+
+/// A process that `Cancel::spawn` started. Dropping it without calling `wait` stops its tree.
+pub struct Running {
+    cancel: Cancel,
+    key: u64,
 }
 
 impl Cancel {
@@ -21,22 +31,22 @@ impl Cancel {
         self.0.requested.load(Ordering::SeqCst)
     }
 
-    /// Stops the running process tree on another thread, so the caller does not wait for it.
+    /// Stops every running process tree on another thread, so the caller does not wait for it.
     pub fn request(&self) {
         if self.0.requested.swap(true, Ordering::SeqCst) {
             return;
         }
         let cancel = self.clone();
         thread::spawn(move || {
-            if let Some(child) = cancel.child().as_mut() {
+            for child in cancel.children().values_mut() {
                 kill_tree(child);
             }
         });
     }
 
     /// Starts `command` as the root of a process tree that `request` can stop.
-    /// Call `wait` after reading the returned output.
-    pub fn spawn(&self, command: &mut Command) -> io::Result<(ChildStdout, ChildStderr)> {
+    /// Call `Running::wait` after reading the returned output.
+    pub fn spawn(&self, command: &mut Command) -> io::Result<(Running, ChildStdout, ChildStderr)> {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -48,41 +58,63 @@ impl Cancel {
         }
         #[cfg(windows)]
         hide_console(command);
+        // Locked before the start. macOS cannot create a pipe that is closed on exec in one step,
+        // so a process that starts at the same time could inherit this one's pipes and keep its
+        // output open.
+        let mut children = self.children();
         let mut child = command.spawn()?;
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
-        let mut slot = self.child();
-        // A request made before the lock was taken found no process to stop.
+        // A request made before the lock was taken did not find this process.
         if self.is_requested() {
             kill_tree(&mut child);
         }
-        *slot = Some(child);
-        Ok((stdout, stderr))
+        let key = self.0.next_key.fetch_add(1, Ordering::SeqCst);
+        children.insert(key, child);
+        let cancel = self.clone();
+        Ok((Running { cancel, key }, stdout, stderr))
     }
 
-    /// Waits for the process from `spawn` without holding the lock that `request` needs.
-    pub fn wait(&self) -> io::Result<ExitStatus> {
+    fn children(&self) -> MutexGuard<'_, HashMap<u64, Child>> {
+        self.0
+            .children
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Running {
+    /// Waits for the process without holding the lock that `Cancel::request` needs.
+    pub fn wait(self) -> io::Result<ExitStatus> {
         loop {
-            let mut slot = self.child();
-            let child = slot.as_mut().expect("spawn was called");
+            let mut children = self.cancel.children();
+            let child = children
+                .get_mut(&self.key)
+                .expect("only wait and drop remove it");
             match child.try_wait() {
                 Ok(None) => {}
                 Ok(Some(status)) => {
-                    *slot = None;
+                    children.remove(&self.key);
                     return Ok(status);
                 }
                 Err(error) => {
-                    *slot = None;
+                    children.remove(&self.key);
                     return Err(error);
                 }
             }
-            drop(slot);
+            drop(children);
             thread::sleep(Duration::from_millis(10));
         }
     }
+}
 
-    fn child(&self) -> MutexGuard<'_, Option<Child>> {
-        self.0.child.lock().unwrap_or_else(PoisonError::into_inner)
+impl Drop for Running {
+    fn drop(&mut self) {
+        let child = self.cancel.children().remove(&self.key);
+        if let Some(mut child) = child {
+            kill_tree(&mut child);
+            let _ = child.wait();
+        }
     }
 }
 
