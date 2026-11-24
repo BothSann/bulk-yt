@@ -1,18 +1,99 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader};
+use std::fmt;
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 
-pub const FORMATS: [(&str, &str, &str); 6] = [
-    ("MP3", "mp3", "Works with most players and editors."),
-    ("WAV", "wav", "Uncompressed audio for editing."),
-    ("M4A", "m4a", "Compact audio for Apple devices."),
-    ("FLAC", "flac", "Lossless compression."),
-    ("Opus", "opus", "Small files with good sound quality."),
-    ("AAC", "aac", "Efficient audio for everyday listening."),
-];
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum AudioFormat {
+    #[default]
+    Mp3,
+    Wav,
+    M4a,
+    Flac,
+    Opus,
+    Aac,
+}
+
+impl AudioFormat {
+    /// Every format, in the order the interface shows them.
+    pub const ALL: [Self; 6] = [
+        Self::Mp3,
+        Self::Wav,
+        Self::M4a,
+        Self::Flac,
+        Self::Opus,
+        Self::Aac,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mp3 => "MP3",
+            Self::Wav => "WAV",
+            Self::M4a => "M4A",
+            Self::Flac => "FLAC",
+            Self::Opus => "Opus",
+            Self::Aac => "AAC",
+        }
+    }
+
+    /// The value of the yt-dlp `--audio-format` argument.
+    pub fn yt_dlp_name(self) -> &'static str {
+        match self {
+            Self::Mp3 => "mp3",
+            Self::Wav => "wav",
+            Self::M4a => "m4a",
+            Self::Flac => "flac",
+            Self::Opus => "opus",
+            Self::Aac => "aac",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Mp3 => "Works with most players and editors.",
+            Self::Wav => "Uncompressed audio for editing.",
+            Self::M4a => "Compact audio for Apple devices.",
+            Self::Flac => "Lossless compression.",
+            Self::Opus => "Small files with good sound quality.",
+            Self::Aac => "Efficient audio for everyday listening.",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum DownloadError {
+    MissingDownloader,
+    Start(io::Error),
+    Wait(io::Error),
+    /// The last error or warning that yt-dlp printed.
+    Reported(String),
+    /// yt-dlp failed without printing an error or warning.
+    Exit(ExitStatus),
+    NoSavedFile,
+    /// The queue's worker thread ended before the job finished.
+    WorkerStopped,
+}
+
+impl fmt::Display for DownloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingDownloader => f.write_str("Install yt-dlp to start downloading."),
+            Self::Start(error) => write!(f, "Could not start yt-dlp. {error}"),
+            Self::Wait(error) => write!(f, "{error}"),
+            Self::Reported(message) => f.write_str(message),
+            Self::Exit(status) => write!(f, "The download ended with {status}."),
+            Self::NoSavedFile => {
+                f.write_str("The downloader finished without reporting a saved audio file.")
+            }
+            Self::WorkerStopped => f.write_str("The download worker stopped unexpectedly."),
+        }
+    }
+}
+
+impl std::error::Error for DownloadError {}
 
 pub struct Links {
     pub urls: Vec<String>,
@@ -83,10 +164,10 @@ pub trait Downloader {
     fn download(
         &self,
         url: &str,
-        format: &str,
+        format: AudioFormat,
         folder: &Path,
         progress: &mut dyn FnMut(Update),
-    ) -> Result<PathBuf, String>;
+    ) -> Result<PathBuf, DownloadError>;
 }
 
 pub struct Tools {
@@ -178,14 +259,14 @@ impl Downloader for Tools {
     fn download(
         &self,
         url: &str,
-        format: &str,
+        format: AudioFormat,
         folder: &Path,
         progress: &mut dyn FnMut(Update),
-    ) -> Result<PathBuf, String> {
+    ) -> Result<PathBuf, DownloadError> {
         let downloader = self
             .downloader
             .as_ref()
-            .ok_or("Install yt-dlp to start downloading.")?;
+            .ok_or(DownloadError::MissingDownloader)?;
         let mut command = Command::new(downloader);
         command
             .env("PATH", &self.path)
@@ -207,7 +288,7 @@ impl Downloader for Tools {
                 "bestaudio/best",
                 "--extract-audio",
                 "--audio-format",
-                format,
+                format.yt_dlp_name(),
                 "--progress-template",
                 "download:bulk-progress:%(progress._percent_str)s",
                 "--print",
@@ -237,7 +318,7 @@ impl Downloader for Tools {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|err| format!("Could not start yt-dlp. {err}"))?;
+            .map_err(DownloadError::Start)?;
         let stderr = child.stderr.take().expect("stderr is piped");
         let errors = thread::spawn(move || {
             let mut last_error = None;
@@ -260,14 +341,14 @@ impl Downloader for Tools {
                 None => {}
             }
         }
-        let status = child.wait().map_err(|err| err.to_string())?;
+        let status = child.wait().map_err(DownloadError::Wait)?;
         let diagnostic = errors.join().ok().flatten();
         if !status.success() {
-            return Err(diagnostic.unwrap_or_else(|| format!("The download ended with {status}.")));
+            return Err(diagnostic.map_or(DownloadError::Exit(status), DownloadError::Reported));
         }
-        output.filter(|file| file.is_file()).ok_or_else(|| {
-            "The downloader finished without reporting a saved audio file.".to_owned()
-        })
+        output
+            .filter(|file| file.is_file())
+            .ok_or(DownloadError::NoSavedFile)
     }
 }
 
@@ -336,6 +417,63 @@ mod tests {
     use super::*;
 
     const ID: &str = "dQw4w9WgXcQ";
+
+    #[test]
+    fn audio_formats_keep_their_order_and_text() {
+        assert_eq!(AudioFormat::default(), AudioFormat::Mp3);
+        assert_eq!(
+            AudioFormat::ALL.map(|format| (
+                format.label(),
+                format.yt_dlp_name(),
+                format.description()
+            )),
+            [
+                ("MP3", "mp3", "Works with most players and editors."),
+                ("WAV", "wav", "Uncompressed audio for editing."),
+                ("M4A", "m4a", "Compact audio for Apple devices."),
+                ("FLAC", "flac", "Lossless compression."),
+                ("Opus", "opus", "Small files with good sound quality."),
+                ("AAC", "aac", "Efficient audio for everyday listening."),
+            ]
+        );
+    }
+
+    #[test]
+    fn download_errors_keep_their_text() {
+        let status = ExitStatus::default();
+        for (error, expected) in [
+            (
+                DownloadError::MissingDownloader,
+                "Install yt-dlp to start downloading.".to_owned(),
+            ),
+            (
+                DownloadError::Start(io::Error::other("not allowed")),
+                "Could not start yt-dlp. not allowed".to_owned(),
+            ),
+            (
+                DownloadError::Wait(io::Error::other("no child")),
+                "no child".to_owned(),
+            ),
+            (
+                DownloadError::Reported("Video unavailable".to_owned()),
+                "Video unavailable".to_owned(),
+            ),
+            (
+                DownloadError::Exit(status),
+                format!("The download ended with {status}."),
+            ),
+            (
+                DownloadError::NoSavedFile,
+                "The downloader finished without reporting a saved audio file.".to_owned(),
+            ),
+            (
+                DownloadError::WorkerStopped,
+                "The download worker stopped unexpectedly.".to_owned(),
+            ),
+        ] {
+            assert_eq!(error.to_string(), expected);
+        }
+    }
 
     #[test]
     fn video_id_accepts_every_supported_link() {

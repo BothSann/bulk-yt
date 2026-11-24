@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use download::{Links, Tools, FORMATS};
+use download::{AudioFormat, Links, Tools};
 use eframe::egui::{
     self, Button, Color32, Context, FontId, Frame, Layout, Margin, RichText, Stroke, TextEdit,
     ThemePreference, Ui, Vec2, ViewportCommand,
@@ -146,7 +146,7 @@ struct App {
     appearance: ThemePreference,
     text: String,
     links: Links,
-    format: usize,
+    format: AudioFormat,
     folder: PathBuf,
     missing: Vec<&'static str>,
     queue: Queue,
@@ -173,7 +173,7 @@ impl App {
             appearance: ThemePreference::System,
             text: String::new(),
             links: download::parse_links(""),
-            format: 0,
+            format: AudioFormat::default(),
             folder,
             missing: Tools::detect().missing(),
             queue: Queue::default(),
@@ -202,7 +202,7 @@ impl App {
         self.queue.start(
             tools,
             self.links.urls.clone(),
-            FORMATS[self.format].1,
+            self.format,
             self.folder.clone(),
             move || ctx.request_repaint(),
         );
@@ -333,22 +333,21 @@ impl App {
             ui.set_min_height(217.0);
             ui.label(theme::heading("Audio format", 19.0));
             ui.label(
-                RichText::new(FORMATS[self.format].2)
+                RichText::new(self.format.description())
                     .size(13.0)
                     .color(palette.muted),
             );
             ui.separator();
             ui.add_enabled_ui(idle, |ui| {
                 let button_width = (ui.available_width() - ui.spacing().item_spacing.x * 2.0) / 3.0;
-                for (row, formats) in FORMATS.chunks(3).enumerate() {
+                for formats in AudioFormat::ALL.chunks(3) {
                     ui.horizontal(|ui| {
-                        for (column, (name, _, _)) in formats.iter().enumerate() {
-                            let index = row * 3 + column;
-                            let selected = self.format == index;
+                        for &format in formats {
+                            let selected = self.format == format;
                             let text = if selected {
-                                theme::medium(*name).color(palette.accent)
+                                theme::medium(format.label()).color(palette.accent)
                             } else {
-                                RichText::new(*name)
+                                RichText::new(format.label())
                             };
                             if ui
                                 .add_sized(
@@ -357,7 +356,7 @@ impl App {
                                 )
                                 .clicked()
                             {
-                                self.format = index;
+                                self.format = format;
                                 self.notice = None;
                             }
                         }
@@ -493,8 +492,8 @@ impl App {
                 ui.horizontal(|ui| {
                     let (status, color) = match job.state {
                         State::Waiting => ("Waiting", palette.muted),
-                        State::Downloading(1.0) => ("Converting", palette.accent),
                         State::Downloading(_) => ("Downloading", palette.accent),
+                        State::Converting => ("Converting", palette.accent),
                         State::Saved(_) => ("Saved", palette.accent),
                         State::Failed(_) => ("Failed", palette.error),
                     };
@@ -507,7 +506,7 @@ impl App {
                         .on_hover_text(name);
                 });
                 match &job.state {
-                    State::Downloading(progress) if *progress == 1.0 => {
+                    State::Converting => {
                         ui.add(
                             egui::ProgressBar::new(1.0)
                                 .fill(palette.accent_surface)
@@ -528,7 +527,7 @@ impl App {
                         );
                     }
                     State::Failed(error) => {
-                        ui.label(RichText::new(error).color(palette.error));
+                        ui.label(RichText::new(error.to_string()).color(palette.error));
                     }
                     State::Waiting => {}
                 }
