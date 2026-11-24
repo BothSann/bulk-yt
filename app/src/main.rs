@@ -1,4 +1,5 @@
 mod download;
+mod queue;
 mod theme;
 
 use std::ffi::OsString;
@@ -6,15 +7,15 @@ use std::fs;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use download::{Links, Tools, Update, FORMATS};
+use download::{Links, Tools, FORMATS};
 use eframe::egui::{
     self, Button, Color32, Context, FontId, Frame, Layout, Margin, RichText, Stroke, TextEdit,
     ThemePreference, Ui, Vec2, ViewportCommand,
 };
+use queue::{Queue, State};
 use theme::Palette;
 
 fn main() -> ExitCode {
@@ -143,25 +144,6 @@ fn save_png(path: &Path, image: &egui::ColorImage) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-enum State {
-    Waiting,
-    Downloading(f32),
-    Saved(PathBuf),
-    Failed(String),
-}
-
-struct Job {
-    url: String,
-    title: Option<String>,
-    state: State,
-}
-
-enum Event {
-    Started(usize),
-    Updated(usize, Update),
-    Finished(usize, Result<PathBuf, String>),
-}
-
 struct App {
     appearance: ThemePreference,
     text: String,
@@ -169,9 +151,8 @@ struct App {
     format: usize,
     folder: PathBuf,
     missing: Vec<&'static str>,
-    jobs: Vec<Job>,
+    queue: Queue,
     output_folder: Option<PathBuf>,
-    receiver: Option<Receiver<Event>>,
     notice: Option<String>,
     show_setup: bool,
     screenshot: Option<Screenshot>,
@@ -197,9 +178,8 @@ impl App {
             format: 0,
             folder,
             missing: Tools::detect().missing(),
-            jobs: Vec::new(),
+            queue: Queue::default(),
             output_folder: None,
-            receiver: None,
             notice: None,
             show_setup: false,
             screenshot,
@@ -219,73 +199,15 @@ impl App {
             return;
         }
         self.notice = None;
-        self.jobs = self
-            .links
-            .urls
-            .iter()
-            .map(|url| Job {
-                url: url.clone(),
-                title: None,
-                state: State::Waiting,
-            })
-            .collect();
         self.output_folder = Some(self.folder.clone());
-        let folder = self.folder.clone();
-        let urls = self.links.urls.clone();
-        let format = FORMATS[self.format].1;
         let ctx = ctx.clone();
-        let (sender, receiver) = mpsc::channel();
-        self.receiver = Some(receiver);
-        thread::spawn(move || {
-            let send = |event| {
-                let _ = sender.send(event);
-                ctx.request_repaint();
-            };
-            for (index, url) in urls.iter().enumerate() {
-                send(Event::Started(index));
-                let result = tools.download(url, format, &folder, |update| {
-                    send(Event::Updated(index, update))
-                });
-                send(Event::Finished(index, result));
-            }
-            drop(sender);
-            ctx.request_repaint();
-        });
-    }
-
-    fn read_events(&mut self) {
-        let Some(receiver) = &self.receiver else {
-            return;
-        };
-        loop {
-            match receiver.try_recv() {
-                Ok(Event::Started(index)) => self.jobs[index].state = State::Downloading(0.0),
-                Ok(Event::Updated(index, Update::Title(title))) => {
-                    self.jobs[index].title = Some(title)
-                }
-                Ok(Event::Updated(index, Update::Progress(progress))) => {
-                    self.jobs[index].state = State::Downloading(progress);
-                }
-                Ok(Event::Finished(index, result)) => {
-                    self.jobs[index].state = match result {
-                        Ok(file) => State::Saved(file),
-                        Err(error) => State::Failed(error),
-                    };
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.receiver = None;
-                    for job in &mut self.jobs {
-                        if matches!(job.state, State::Waiting | State::Downloading(_)) {
-                            job.state = State::Failed(
-                                "The download worker stopped unexpectedly.".to_owned(),
-                            );
-                        }
-                    }
-                    break;
-                }
-            }
-        }
+        self.queue.start(
+            tools,
+            self.links.urls.clone(),
+            FORMATS[self.format].1,
+            self.folder.clone(),
+            move || ctx.request_repaint(),
+        );
     }
 
     fn header(&mut self, ui: &mut Ui, palette: &Palette) {
@@ -334,7 +256,7 @@ impl App {
     }
 
     fn links_panel(&mut self, ui: &mut Ui, width: f32, palette: &Palette) {
-        let idle = self.receiver.is_none();
+        let idle = !self.queue.is_running();
         card(ui, width, palette, |ui| {
             ui.set_min_height(217.0);
             ui.horizontal(|ui| {
@@ -408,7 +330,7 @@ impl App {
     }
 
     fn settings_panel(&mut self, ui: &mut Ui, width: f32, palette: &Palette) {
-        let idle = self.receiver.is_none();
+        let idle = !self.queue.is_running();
         card(ui, width, palette, |ui| {
             ui.set_min_height(217.0);
             ui.label(theme::heading("Audio format", 19.0));
@@ -481,7 +403,7 @@ impl App {
     }
 
     fn actions(&mut self, ui: &mut Ui, palette: &Palette) {
-        let busy = self.receiver.is_some();
+        let busy = self.queue.is_running();
         let height = 36.0;
         ui.allocate_ui_with_layout(
             Vec2::new(ui.available_width(), height),
@@ -539,14 +461,15 @@ impl App {
                         }
                     }
                     let saved = self
-                        .jobs
+                        .queue
+                        .jobs()
                         .iter()
                         .filter(|job| matches!(job.state, State::Saved(_)))
                         .count();
-                    if !self.jobs.is_empty() {
+                    if !self.queue.jobs().is_empty() {
                         pill(
                             ui,
-                            &format!("{saved} / {} saved", self.jobs.len()),
+                            &format!("{saved} / {} saved", self.queue.jobs().len()),
                             palette.accent_surface,
                             palette.accent,
                         );
@@ -554,7 +477,7 @@ impl App {
                 });
             });
             ui.separator();
-            if self.jobs.is_empty() {
+            if self.queue.jobs().is_empty() {
                 ui.add_space(7.0);
                 ui.horizontal(|ui| {
                     wave_mark(ui, 36.0, palette.accent_surface, palette.accent);
@@ -568,7 +491,7 @@ impl App {
                     });
                 });
             }
-            for job in &self.jobs {
+            for job in self.queue.jobs() {
                 ui.horizontal(|ui| {
                     let (status, color) = match job.state {
                         State::Waiting => ("Waiting", palette.muted),
@@ -657,8 +580,8 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        self.read_events();
-        if self.receiver.is_some() && ctx.input(|input| input.viewport().close_requested()) {
+        self.queue.poll();
+        if self.queue.is_running() && ctx.input(|input| input.viewport().close_requested()) {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.notice = Some("You can close the window when this batch finishes.".to_owned());
         }
