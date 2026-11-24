@@ -2,13 +2,15 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
-use crate::download::{Downloader, Update};
+use crate::download::{AudioFormat, DownloadError, Downloader, Update};
 
 pub enum State {
     Waiting,
     Downloading(f32),
+    /// The download is complete and FFmpeg is writing the audio file.
+    Converting,
     Saved(PathBuf),
-    Failed(String),
+    Failed(DownloadError),
 }
 
 pub struct Job {
@@ -20,7 +22,7 @@ pub struct Job {
 enum Event {
     Started(usize),
     Updated(usize, Update),
-    Finished(usize, Result<PathBuf, String>),
+    Finished(usize, Result<PathBuf, DownloadError>),
 }
 
 #[derive(Default)]
@@ -44,7 +46,7 @@ impl Queue {
         &mut self,
         downloader: impl Downloader + Send + 'static,
         urls: Vec<String>,
-        format: &'static str,
+        format: AudioFormat,
         folder: PathBuf,
         notify: impl Fn() + Send + 'static,
     ) {
@@ -87,7 +89,11 @@ impl Queue {
                     self.jobs[index].title = Some(title)
                 }
                 Ok(Event::Updated(index, Update::Progress(progress))) => {
-                    self.jobs[index].state = State::Downloading(progress);
+                    self.jobs[index].state = if progress >= 1.0 {
+                        State::Converting
+                    } else {
+                        State::Downloading(progress)
+                    };
                 }
                 Ok(Event::Finished(index, result)) => {
                     self.jobs[index].state = match result {
@@ -99,10 +105,11 @@ impl Queue {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.receiver = None;
                     for job in &mut self.jobs {
-                        if matches!(job.state, State::Waiting | State::Downloading(_)) {
-                            job.state = State::Failed(
-                                "The download worker stopped unexpectedly.".to_owned(),
-                            );
+                        if matches!(
+                            job.state,
+                            State::Waiting | State::Downloading(_) | State::Converting
+                        ) {
+                            job.state = State::Failed(DownloadError::WorkerStopped);
                         }
                     }
                     break;
@@ -125,26 +132,32 @@ mod tests {
 
     impl<F> Downloader for Fake<F>
     where
-        F: Fn(&str, &mut dyn FnMut(Update)) -> Result<PathBuf, String>,
+        F: Fn(&str, &mut dyn FnMut(Update)) -> Result<PathBuf, DownloadError>,
     {
         fn download(
             &self,
             url: &str,
-            _format: &str,
+            _format: AudioFormat,
             _folder: &Path,
             progress: &mut dyn FnMut(Update),
-        ) -> Result<PathBuf, String> {
+        ) -> Result<PathBuf, DownloadError> {
             (self.0)(url, progress)
         }
     }
 
     fn start<F>(urls: &[&str], download: F) -> Queue
     where
-        F: Fn(&str, &mut dyn FnMut(Update)) -> Result<PathBuf, String> + Send + 'static,
+        F: Fn(&str, &mut dyn FnMut(Update)) -> Result<PathBuf, DownloadError> + Send + 'static,
     {
         let mut queue = Queue::default();
         let urls = urls.iter().map(|url| (*url).to_owned()).collect();
-        queue.start(Fake(download), urls, "mp3", PathBuf::from("out"), || {});
+        queue.start(
+            Fake(download),
+            urls,
+            AudioFormat::Mp3,
+            PathBuf::from("out"),
+            || {},
+        );
         queue
     }
 
@@ -195,13 +208,13 @@ mod tests {
     #[test]
     fn failed_job_does_not_stop_the_next_one() {
         let mut queue = start(&["bad", "good"], |url, _| match url {
-            "bad" => Err("Video unavailable".to_owned()),
+            "bad" => Err(DownloadError::Reported("Video unavailable".to_owned())),
             _ => Ok(PathBuf::from("good.mp3")),
         });
         finish(&mut queue);
 
         assert!(
-            matches!(&queue.jobs()[0].state, State::Failed(error) if error == "Video unavailable")
+            matches!(&queue.jobs()[0].state, State::Failed(DownloadError::Reported(error)) if error == "Video unavailable")
         );
         assert!(matches!(queue.jobs()[1].state, State::Saved(_)));
     }
@@ -216,10 +229,48 @@ mod tests {
 
         assert!(matches!(queue.jobs()[0].state, State::Saved(_)));
         for job in &queue.jobs()[1..] {
-            assert!(
-                matches!(&job.state, State::Failed(error) if error == "The download worker stopped unexpectedly.")
-            );
+            assert!(matches!(
+                job.state,
+                State::Failed(DownloadError::WorkerStopped)
+            ));
         }
+    }
+
+    #[test]
+    fn job_moves_from_downloading_to_converting_to_saved() {
+        let (step, blocked) = mpsc::channel::<()>();
+        let mut queue = start(&["a"], move |_, progress| {
+            progress(Update::Progress(0.999));
+            let _ = blocked.recv();
+            progress(Update::Progress(1.0));
+            let _ = blocked.recv();
+            Ok(PathBuf::from("saved.mp3"))
+        });
+        poll_until(
+            &mut queue,
+            |queue| matches!(queue.jobs()[0].state, State::Downloading(value) if value == 0.999),
+        );
+        step.send(()).unwrap();
+        poll_until(&mut queue, |queue| {
+            matches!(queue.jobs()[0].state, State::Converting)
+        });
+        assert!(queue.is_running());
+        step.send(()).unwrap();
+        finish(&mut queue);
+        assert!(matches!(queue.jobs()[0].state, State::Saved(_)));
+    }
+
+    #[test]
+    fn worker_crash_while_converting_fails_the_job() {
+        let mut queue = start(&["a"], |_, progress| {
+            progress(Update::Progress(1.0));
+            panic!("expected by this test")
+        });
+        finish(&mut queue);
+        assert!(matches!(
+            queue.jobs()[0].state,
+            State::Failed(DownloadError::WorkerStopped)
+        ));
     }
 
     #[test]
@@ -244,16 +295,16 @@ mod tests {
 
     #[test]
     fn passes_format_and_folder_and_notifies_for_each_event() {
-        struct Recorder(Arc<Mutex<Option<(String, PathBuf)>>>);
+        struct Recorder(Arc<Mutex<Option<(AudioFormat, PathBuf)>>>);
         impl Downloader for Recorder {
             fn download(
                 &self,
                 _url: &str,
-                format: &str,
+                format: AudioFormat,
                 folder: &Path,
                 progress: &mut dyn FnMut(Update),
-            ) -> Result<PathBuf, String> {
-                *self.0.lock().unwrap() = Some((format.to_owned(), folder.to_owned()));
+            ) -> Result<PathBuf, DownloadError> {
+                *self.0.lock().unwrap() = Some((format, folder.to_owned()));
                 progress(Update::Progress(0.5));
                 Ok(PathBuf::from("saved.flac"))
             }
@@ -265,7 +316,7 @@ mod tests {
         queue.start(
             Recorder(received.clone()),
             vec!["a".to_owned()],
-            "flac",
+            AudioFormat::Flac,
             PathBuf::from("music"),
             move || {
                 counter.fetch_add(1, Ordering::SeqCst);
@@ -275,7 +326,7 @@ mod tests {
 
         assert_eq!(
             *received.lock().unwrap(),
-            Some(("flac".to_owned(), PathBuf::from("music")))
+            Some((AudioFormat::Flac, PathBuf::from("music")))
         );
         // Started, progress, finished, and one call after the channel closes.
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -290,9 +341,9 @@ mod tests {
         let mut queue = start(&["a", "b"], |_, _| Ok(PathBuf::from("saved.mp3")));
         finish(&mut queue);
         queue.start(
-            Fake(|_: &str, _: &mut dyn FnMut(Update)| Err("offline".to_owned())),
+            Fake(|_: &str, _: &mut dyn FnMut(Update)| Err(DownloadError::NoSavedFile)),
             vec!["c".to_owned()],
-            "mp3",
+            AudioFormat::Mp3,
             PathBuf::from("out"),
             || {},
         );
