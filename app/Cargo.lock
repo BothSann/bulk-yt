@@ -378,6 +378,7 @@ name = "bulk-yt"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "libc",
  "png 0.17.16",
  "rfd",
  "winit",

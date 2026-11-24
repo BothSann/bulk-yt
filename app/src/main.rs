@@ -1,3 +1,4 @@
+mod cancel;
 mod download;
 mod queue;
 mod theme;
@@ -431,6 +432,20 @@ impl App {
                 {
                     self.start(ui.ctx());
                 }
+                if busy {
+                    let cancelling = self.queue.is_cancelling();
+                    let label = if cancelling {
+                        "Cancelling…"
+                    } else {
+                        "Cancel"
+                    };
+                    let button = Button::new(theme::medium(label))
+                        .min_size(Vec2::new(96.0, height))
+                        .corner_radius(6);
+                    if ui.add_enabled(!cancelling, button).clicked() {
+                        self.queue.cancel();
+                    }
+                }
                 ui.with_layout(Layout::left_to_right(egui::Align::Center), |ui| {
                     if !self.missing.is_empty() && ui.button("Set up downloads…").clicked() {
                         self.show_setup = true;
@@ -496,6 +511,7 @@ impl App {
                         State::Converting => ("Converting", palette.accent),
                         State::Saved(_) => ("Saved", palette.accent),
                         State::Failed(_) => ("Failed", palette.error),
+                        State::Cancelled => ("Cancelled", palette.muted),
                     };
                     ui.add_sized(
                         [92.0, 20.0],
@@ -529,7 +545,7 @@ impl App {
                     State::Failed(error) => {
                         ui.label(RichText::new(error.to_string()).color(palette.error));
                     }
-                    State::Waiting => {}
+                    State::Waiting | State::Cancelled => {}
                 }
                 ui.separator();
             }
