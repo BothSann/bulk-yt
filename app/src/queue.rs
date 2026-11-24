@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::cancel::Cancel;
-use crate::download::{AudioFormat, DownloadError, Downloader, Update};
+use crate::downloader::{DownloadError, Downloader, Update};
+use crate::format::AudioFormat;
 
 /// The number of downloads that can run at once.
 const MAX_WORKERS: usize = 3;

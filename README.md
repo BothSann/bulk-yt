@@ -47,11 +47,16 @@ cargo run --release
 
 | Path | Purpose |
 | --- | --- |
-| `app/src/main.rs` | App state and interface |
+| `app/src/main.rs` | Command-line arguments and startup |
+| `app/src/app.rs` | App state and actions |
+| `app/src/ui` | Window layout, panels, and shared widgets |
+| `app/src/theme.rs` | Colors, fonts, and egui styling |
+| `app/src/screenshot.rs` | The `--screenshot` option |
 | `app/src/queue.rs` | Download queue and background workers |
 | `app/src/cancel.rs` | Stopping a batch and its processes |
-| `app/src/download.rs` | Link parsing, tool detection, and yt-dlp |
-| `app/src/theme.rs` | Colors, fonts, and egui styling |
+| `app/src/downloader.rs` | Tool detection and yt-dlp |
+| `app/src/links.rs` | Link parsing |
+| `app/src/format.rs` | Audio formats |
 | `app/assets/fonts` | Bundled fonts. Inter is under the SIL Open Font License. |
 
 ## Responsible use

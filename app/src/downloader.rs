@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
@@ -9,63 +8,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::cancel::Cancel;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub enum AudioFormat {
-    #[default]
-    Mp3,
-    Wav,
-    M4a,
-    Flac,
-    Opus,
-    Aac,
-}
-
-impl AudioFormat {
-    /// Every format, in the order the interface shows them.
-    pub const ALL: [Self; 6] = [
-        Self::Mp3,
-        Self::Wav,
-        Self::M4a,
-        Self::Flac,
-        Self::Opus,
-        Self::Aac,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Mp3 => "MP3",
-            Self::Wav => "WAV",
-            Self::M4a => "M4A",
-            Self::Flac => "FLAC",
-            Self::Opus => "Opus",
-            Self::Aac => "AAC",
-        }
-    }
-
-    /// The value of the yt-dlp `--audio-format` argument.
-    pub fn yt_dlp_name(self) -> &'static str {
-        match self {
-            Self::Mp3 => "mp3",
-            Self::Wav => "wav",
-            Self::M4a => "m4a",
-            Self::Flac => "flac",
-            Self::Opus => "opus",
-            Self::Aac => "aac",
-        }
-    }
-
-    pub fn description(self) -> &'static str {
-        match self {
-            Self::Mp3 => "Works with most players and editors.",
-            Self::Wav => "Uncompressed audio for editing.",
-            Self::M4a => "Compact audio for Apple devices.",
-            Self::Flac => "Lossless compression.",
-            Self::Opus => "Small files with good sound quality.",
-            Self::Aac => "Efficient audio for everyday listening.",
-        }
-    }
-}
+use crate::format::AudioFormat;
+use crate::links::video_id;
 
 #[derive(Debug)]
 pub enum DownloadError {
@@ -100,70 +44,6 @@ impl fmt::Display for DownloadError {
 }
 
 impl std::error::Error for DownloadError {}
-
-pub struct Links {
-    pub urls: Vec<String>,
-    pub invalid: usize,
-    pub duplicates: usize,
-}
-
-pub fn parse_links(text: &str) -> Links {
-    let mut result = Links {
-        urls: Vec::new(),
-        invalid: 0,
-        duplicates: 0,
-    };
-    let mut seen = HashSet::new();
-    for part in text.split(|c: char| c.is_whitespace() || c == ',') {
-        let token = part.trim_matches(['<', '>', '(', ')', '[', ']', '"', '\'']);
-        if token.is_empty() {
-            continue;
-        }
-        match video_id(token) {
-            Some(id) if seen.insert(id) => result
-                .urls
-                .push(format!("https://www.youtube.com/watch?v={id}")),
-            Some(_) => result.duplicates += 1,
-            None => result.invalid += 1,
-        }
-    }
-    result
-}
-
-fn video_id(token: &str) -> Option<&str> {
-    let rest = token
-        .strip_prefix("https://")
-        .or_else(|| token.strip_prefix("http://"))
-        .unwrap_or(token);
-    let (host, path) = rest.split_once('/')?;
-    let (path, query) = path
-        .split('#')
-        .next()?
-        .split_once('?')
-        .unwrap_or((path, ""));
-    let id = match host.to_ascii_lowercase().as_str() {
-        "youtu.be" => path,
-        "youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com" => {
-            if path == "watch" {
-                query
-                    .split('&')
-                    .find_map(|parameter| parameter.strip_prefix("v="))?
-            } else {
-                let (kind, id) = path.split_once('/')?;
-                match kind {
-                    "shorts" | "live" | "embed" | "v" => id,
-                    _ => return None,
-                }
-            }
-        }
-        _ => return None,
-    };
-    (id.len() == 11
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
-    .then_some(id)
-}
 
 pub trait Downloader {
     /// Saves the audio of `url` in `folder` and returns the saved file.
@@ -433,23 +313,6 @@ fn parse_diagnostic(line: &str) -> Option<Diagnostic> {
     }
 }
 
-pub fn open_folder(folder: &Path) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let program = "open";
-    #[cfg(windows)]
-    let program = "explorer";
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let program = "xdg-open";
-    let mut child = Command::new(program)
-        .arg(folder)
-        .spawn()
-        .map_err(|err| format!("Could not open the folder. {err}"))?;
-    thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Read;
@@ -458,28 +321,6 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-
-    const ID: &str = "dQw4w9WgXcQ";
-
-    #[test]
-    fn audio_formats_keep_their_order_and_text() {
-        assert_eq!(AudioFormat::default(), AudioFormat::Mp3);
-        assert_eq!(
-            AudioFormat::ALL.map(|format| (
-                format.label(),
-                format.yt_dlp_name(),
-                format.description()
-            )),
-            [
-                ("MP3", "mp3", "Works with most players and editors."),
-                ("WAV", "wav", "Uncompressed audio for editing."),
-                ("M4A", "m4a", "Compact audio for Apple devices."),
-                ("FLAC", "flac", "Lossless compression."),
-                ("Opus", "opus", "Small files with good sound quality."),
-                ("AAC", "aac", "Efficient audio for everyday listening."),
-            ]
-        );
-    }
 
     #[test]
     fn download_errors_keep_their_text() {
@@ -520,85 +361,6 @@ mod tests {
         ] {
             assert_eq!(error.to_string(), expected);
         }
-    }
-
-    #[test]
-    fn video_id_accepts_every_supported_link() {
-        for link in [
-            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-            "http://youtube.com/watch?v=dQw4w9WgXcQ",
-            "youtube.com/watch?v=dQw4w9WgXcQ",
-            "https://m.youtube.com/watch?v=dQw4w9WgXcQ",
-            "https://music.youtube.com/watch?v=dQw4w9WgXcQ&si=abc",
-            "https://WWW.YouTube.com/watch?v=dQw4w9WgXcQ",
-            "https://www.youtube.com/watch?list=PL123&v=dQw4w9WgXcQ&t=5s",
-            "https://www.youtube.com/watch?v=dQw4w9WgXcQ#comments",
-            "https://youtu.be/dQw4w9WgXcQ",
-            "https://youtu.be/dQw4w9WgXcQ?t=10",
-            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
-            "https://www.youtube.com/live/dQw4w9WgXcQ?feature=share",
-            "https://www.youtube.com/embed/dQw4w9WgXcQ",
-            "https://www.youtube.com/v/dQw4w9WgXcQ",
-        ] {
-            assert_eq!(video_id(link), Some(ID), "{link}");
-        }
-    }
-
-    #[test]
-    fn video_id_rejects_other_links() {
-        for link in [
-            "",
-            "dQw4w9WgXcQ",
-            "https://www.youtube.com",
-            "https://www.youtube.com/",
-            "https://www.youtube.com/watch",
-            "https://www.youtube.com/watch?list=PL123",
-            "https://www.youtube.com/playlist?list=PL123",
-            "https://www.youtube.com/channel/dQw4w9WgXcQ",
-            "https://www.youtube.com/watch?v=tooshort",
-            "https://www.youtube.com/watch?v=dQw4w9WgXcQQ",
-            "https://youtu.be/dQw4w9WgXc!",
-            "https://example.com/watch?v=dQw4w9WgXcQ",
-            "https://youtube.com.example.com/watch?v=dQw4w9WgXcQ",
-            "ftp://youtube.com/watch?v=dQw4w9WgXcQ",
-        ] {
-            assert_eq!(video_id(link), None, "{link}");
-        }
-    }
-
-    #[test]
-    fn parse_links_of_empty_text_finds_nothing() {
-        for text in ["", " \n\t , ", "<>"] {
-            let links = parse_links(text);
-            assert!(links.urls.is_empty());
-            assert_eq!((links.invalid, links.duplicates), (0, 0));
-        }
-    }
-
-    #[test]
-    fn parse_links_splits_and_normalizes_in_order() {
-        let links = parse_links(
-            "https://youtu.be/aaaaaaaaaaa, <https://youtu.be/bbbbbbbbbbb>\n\"youtube.com/shorts/ccccccccccc\"\t(https://youtu.be/d-d_ddddddd)",
-        );
-        assert_eq!(
-            links.urls,
-            [
-                "https://www.youtube.com/watch?v=aaaaaaaaaaa",
-                "https://www.youtube.com/watch?v=bbbbbbbbbbb",
-                "https://www.youtube.com/watch?v=ccccccccccc",
-                "https://www.youtube.com/watch?v=d-d_ddddddd",
-            ]
-        );
-        assert_eq!((links.invalid, links.duplicates), (0, 0));
-    }
-
-    #[test]
-    fn parse_links_counts_invalid_and_duplicate_links() {
-        let links = parse_links(
-            "https://youtu.be/dQw4w9WgXcQ https://www.youtube.com/watch?v=dQw4w9WgXcQ hello https://example.com/",
-        );
-        assert_eq!(links.urls, ["https://www.youtube.com/watch?v=dQw4w9WgXcQ"]);
-        assert_eq!((links.invalid, links.duplicates), (2, 1));
     }
 
     #[test]
@@ -682,7 +444,7 @@ mod tests {
     fn fake_downloader(role: &str, address: &str) -> Command {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
-            .args(["--exact", "download::tests::act_as_fake_downloader"])
+            .args(["--exact", "downloader::tests::act_as_fake_downloader"])
             .args(["--ignored", "--nocapture"])
             .env(FAKE, format!("{role} {address}"));
         command
