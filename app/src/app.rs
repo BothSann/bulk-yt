@@ -4,16 +4,18 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 
-use eframe::egui::{Context, ThemePreference};
+use eframe::egui::{Context, TextureHandle, ThemePreference};
 
 use crate::downloader::Tools;
 use crate::format::AudioFormat;
+use crate::icon;
 use crate::links::{self, Links};
 use crate::queue::Queue;
 use crate::screenshot::Screenshot;
 
 /// The state of the app and what it can do. The interface in `ui` reads and changes it.
 pub struct App {
+    pub logo: TextureHandle,
     pub appearance: ThemePreference,
     pub text: String,
     pub links: Links,
@@ -30,6 +32,7 @@ pub struct App {
 
 impl App {
     pub fn new(
+        ctx: &Context,
         screenshot: Option<Screenshot>,
         capture_result: mpsc::SyncSender<Result<(), String>>,
     ) -> Self {
@@ -41,6 +44,7 @@ impl App {
             .join("Downloads")
             .join("Batch Audio");
         Self {
+            logo: icon::logo(ctx),
             appearance: ThemePreference::System,
             text: String::new(),
             links: links::parse_links(""),
