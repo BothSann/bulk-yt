@@ -1,13 +1,13 @@
-use eframe::egui::{self, Color32, Layout, RichText, ThemePreference, Ui};
+use eframe::egui::{self, Image, Layout, RichText, ThemePreference, Ui, Vec2};
 
-use super::widgets::wave_mark;
 use crate::app::App;
+use crate::icon;
 use crate::theme::{self, Palette};
 
 impl App {
     pub(super) fn header(&mut self, ui: &mut Ui, palette: &Palette) {
         ui.horizontal(|ui| {
-            wave_mark(ui, 40.0, palette.brand, Color32::WHITE);
+            ui.add(Image::new((self.logo.id(), Vec2::splat(40.0))).uv(icon::logo_crop()));
             ui.add_space(4.0);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 3.0;

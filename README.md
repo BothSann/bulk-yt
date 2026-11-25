@@ -61,6 +61,9 @@ The app looks for the tools next to its own executable and on your `PATH`. On ma
 | `app/src/downloader.rs` | Tool detection and yt-dlp |
 | `app/src/links.rs` | Link parsing |
 | `app/src/format.rs` | Audio formats |
+| `app/src/icon.rs` | App icon and header logo |
+| `app/build.rs` | Windows executable icon and name |
+| `app/assets/icons` | Icon files |
 | `app/assets/fonts` | Bundled fonts. Inter is under the SIL Open Font License. |
 
 Dependencies point one way: `ui` → `app` → `queue` → `downloader`. `queue`, `downloader`, `links`, and `format` do not import egui or eframe, so their tests need no window.

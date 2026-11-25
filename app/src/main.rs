@@ -2,6 +2,7 @@ mod app;
 mod cancel;
 mod downloader;
 mod format;
+mod icon;
 mod links;
 mod queue;
 mod screenshot;
@@ -28,6 +29,7 @@ fn main() -> ExitCode {
         }
     };
     let mut viewport = egui::ViewportBuilder::default()
+        .with_icon(icon::app_icon())
         .with_inner_size([1030.0, 740.0])
         .with_min_inner_size([540.0, 480.0]);
     if screenshot.is_some() {
@@ -58,7 +60,7 @@ fn main() -> ExitCode {
         Box::new(move |cc| {
             theme::configure(&cc.egui_ctx);
             cc.egui_ctx.set_theme(ThemePreference::System);
-            Ok(Box::new(App::new(screenshot, capture_tx)))
+            Ok(Box::new(App::new(&cc.egui_ctx, screenshot, capture_tx)))
         }),
     );
     if let Err(error) = result {
